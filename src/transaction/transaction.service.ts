@@ -9,7 +9,7 @@ export class TransactionService {
 
   constructor(private readonly configService: ConfigService) {}
 
-  async createTransaction(id: string): Promise<string> {
+  async createTransaction(id: string): Promise<Transaction> {
     // Vérifier les doublons
     if (this.cache.has(id)) {
       throw new HttpException('Duplicate request', HttpStatus.CONFLICT);
@@ -18,40 +18,58 @@ export class TransactionService {
     const transaction = new Transaction(id);
     this.cache.set(id, transaction);
 
-    const webhookUrl = `${this.configService.get<string>('WEBHOOK_URL')}/${id}`;
+    const webhookUrl = this.configService.get<string>('WEBHOOK_URL');
     const thirdPartyApiUrl = this.configService.get<string>('THIRD_PARTY_API_URL');
     const statusApiUrl = `${thirdPartyApiUrl}/${id}`;
+    const timeOut = this.configService.get<number>('TIME_OUT') || 5000;
+    const maxWaitTime = this.configService.get<number>('MAX_WAIT_TIME') || 120000;
 
     try {
       // Essayer d'appeler le service tiers
       const response = await Promise.race([
         axios.post(thirdPartyApiUrl, { id, webhookUrl }),
-        this.timeout(5000), // Timeout de 5s
+        this.timeout(timeOut), // Timeout de 5s
       ]);
 
       // Si une réponse immédiate est disponible
       if (response) {
-        const status = response.data.status; // Supposons completed | declined
-        transaction.status =
-          status === 'completed' ? TransactionStatus.COMPLETED : TransactionStatus.DECLINED;
-        return status === 'completed' ? 'accepted' : 'declined';
+        const status = response.data.status; // completed | declined
+        transaction.status = status === 'completed' ? TransactionStatus.COMPLETED : TransactionStatus.DECLINED;
+        return transaction;
       }
     } catch (error) {
-      console.error('Third-party API call failed or timed out:', error.message);
+      console.error('Third-party API call (',thirdPartyApiUrl,') failed or timed out:', error.message);
 
       // Si le service retourne une erreur 504, on planifie une vérification
       if (error.response?.status === 504) {
-        this.scheduleStatusCheck(id, statusApiUrl, 120000); // Planifie des vérifications jusqu'à 120 secondes
+        this.scheduleStatusCheck(id, statusApiUrl, maxWaitTime); // Planifie des vérifications jusqu'à 120 secondes
       }
     }
 
     // Retourner "pending" immédiatement
-    return 'pending';
+    transaction.status = TransactionStatus.PENDING;
+    return transaction;
+  }
+
+  private async notifClt(id: string, etat: string) {
+    const cltUrl = this.configService.get<string>('CLIENT_URL');
+    const objet = {
+      status : {
+        id : id,
+        status : etat
+      }
+    };
+
+    try {
+      await axios.put(cltUrl, objet);
+    } catch (error) {
+      console.error(`Status update failed for transaction ${id}:`, error.message);
+    }
   }
 
   private async scheduleStatusCheck(id: string, statusApiUrl: string, maxWaitTime: number) {
     let retryCount = 0;
-    const retryInterval = 10000; // Intervalle de vérification : 10 secondes
+    const retryInterval = this.configService.get<number>('INTERVAL') || 5000;
 
     while (retryCount * retryInterval < maxWaitTime) {
       retryCount++;
@@ -65,11 +83,12 @@ export class TransactionService {
 
       try {
         const response = await axios.get(statusApiUrl);
-        const status = response.data.status; // Supposons completed | declined
+        const status = response.data.status; // completed | declined
 
-        transaction.status =
-          status === 'completed' ? TransactionStatus.COMPLETED : TransactionStatus.DECLINED;
+        transaction.status = status === 'completed' ? TransactionStatus.COMPLETED : TransactionStatus.DECLINED;
         this.cache.set(id, transaction);
+        //
+        this.notifClt(id, status);
 
         console.log(`Transaction ${id} updated to ${transaction.status}`);
         return; // Arrêter après une mise à jour réussie
@@ -97,14 +116,17 @@ export class TransactionService {
   }
 
   updateTransactionStatus(id: string, status: string): void {
+    console.error('appel du webhook id: ', id, ' status: ', status);
     const transaction = this.cache.get(id);
 
-    if (transaction) {
+    if (transaction && transaction.status === TransactionStatus.PENDING) {
       transaction.status =
         status === 'completed'
           ? TransactionStatus.COMPLETED
           : TransactionStatus.DECLINED;
       this.cache.set(id, transaction);
+      //
+      this.notifClt(id, transaction.status);
     }
   }
 }
